@@ -1,0 +1,12 @@
+# Python cache
+__pycache__/
+
+# Virtual environment
+venv/
+.env
+
+# Qdrant storage (runtime generated)
+qdrant_storage/
+
+# Data (kalau isinya hasil testing / sample, bukan dataset resmi)
+data/

@@ -19,7 +19,7 @@ class SentenceTransformerEmbedder(EmbeddingInterface):
 
 
 class QdrantVectorDB(VectorDBInterface):
-    def __init__(self, embedder: EmbeddingInterface, collection_name: str = None, similarity_threshold: float = 0.4):
+    def __init__(self, embedder: EmbeddingInterface, collection_name: str = None, similarity_threshold: float = 0.5):
         from qdrant_client import QdrantClient
         from qdrant_client.models import Distance, VectorParams
 

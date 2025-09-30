@@ -1,11 +1,11 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Optional
+from typing import Dict, List, Optional
 import os
 
 from database import vector_db, VectorDBFactory
 from models import Document, Query, RAGResponse, HealthCheck, SearchResult
-from utils import format_sources, generate_response_with_ollama, check_ollama_health, build_enhanced_query
+from utils import format_sources, generate_response_with_ollama, check_ollama_health, build_enhanced_query, generate_stream_response_with_ollama
 from document_processors import DocumentProcessorFactory
 from conversation_manager import conversation_manager
 
@@ -122,6 +122,10 @@ async def search_documents(query: Query):
             status_code=500, detail=f"Error searching: {str(e)}")
 
 
+from fastapi.responses import StreamingResponse
+import json
+from models import StreamResponse, StreamOption
+
 @app.post("/ask", response_model=RAGResponse, tags=["RAG"])
 async def ask_question(query: Query, background_tasks: BackgroundTasks):
     """Ask a question using RAG dengan conversation context internal"""
@@ -131,7 +135,6 @@ async def ask_question(query: Query, background_tasks: BackgroundTasks):
 
         # Validasi conversation ID
         if conversation_id and not conversation_manager.conversation_exists(conversation_id):
-            # Jika conversation ID tidak valid, buat baru
             conversation_id = None
 
         # Buat conversation baru jika tidak ada ID yang valid
@@ -149,6 +152,7 @@ async def ask_question(query: Query, background_tasks: BackgroundTasks):
         print(f"Original query: {query.question}")
         print(f"Enhanced query: {enhanced_query}")
         print(f"Conversation ID: {conversation_id}")
+        print(f"Stream: {query.stream}")
 
         # 1. Retrieve relevant documents dengan enhanced query
         results = vector_db.search(enhanced_query, query.top_k)
@@ -164,7 +168,6 @@ async def ask_question(query: Query, background_tasks: BackgroundTasks):
                 conversation_id=conversation_id
             )
 
-            # Simpan ke conversation history
             background_tasks.add_task(
                 conversation_manager.add_message,
                 conversation_id,
@@ -214,40 +217,108 @@ async def ask_question(query: Query, background_tasks: BackgroundTasks):
             [f"Source {i+1} (relevansi: {result['score']:.2f}):\n{result['text']}"
              for i, result in enumerate(results)])
 
-        # 4. Generate response dengan conversation history internal
-        answer = generate_response_with_ollama(
-            context, query.question, conversation_history)
-
-        response = RAGResponse(
-            answer=answer,
-            sources=format_sources(results),
-            question=query.question,
-            conversation_id=conversation_id
-        )
-
-        # Simpan ke conversation history
-        background_tasks.add_task(
-            conversation_manager.add_message,
-            conversation_id,
-            "user",
-            query.question,
-            {"has_relevant_docs": True, "doc_count": len(
-                results), "max_score": max_score}
-        )
-        background_tasks.add_task(
-            conversation_manager.add_message,
-            conversation_id,
-            "assistant",
-            answer,
-            {"has_relevant_docs": True, "sources_count": len(results)}
-        )
-
-        return response
+        # 4. Handle streaming vs non-streaming
+        if query.stream == StreamOption.TRUE:
+            return await handle_streaming_response(
+                context, query.question, conversation_history, 
+                results, conversation_id, background_tasks
+            )
+        else:
+            return await handle_normal_response(
+                context, query.question, conversation_history,
+                results, conversation_id, background_tasks
+            )
 
     except Exception as e:
         print(f"Error in ask_question: {e}")
         raise HTTPException(
             status_code=500, detail=f"Error generating response: {str(e)}")
+
+async def handle_normal_response(context: str, question: str, conversation_history: List[Dict],
+                               results: List, conversation_id: str, background_tasks: BackgroundTasks):
+    """Handle non-streaming response"""
+    answer = generate_response_with_ollama(
+        context, question, conversation_history)
+
+    response = RAGResponse(
+        answer=answer,
+        sources=format_sources(results),
+        question=question,
+        conversation_id=conversation_id
+    )
+
+    # Simpan ke conversation history
+    max_score = max([result["score"] for result in results])
+    background_tasks.add_task(
+        conversation_manager.add_message,
+        conversation_id,
+        "user",
+        question,
+        {"has_relevant_docs": True, "doc_count": len(results), "max_score": max_score}
+    )
+    background_tasks.add_task(
+        conversation_manager.add_message,
+        conversation_id,
+        "assistant",
+        answer,
+        {"has_relevant_docs": True, "sources_count": len(results)}
+    )
+
+    return response
+
+async def handle_streaming_response(context: str, question: str, conversation_history: List[Dict],
+                                  results: List, conversation_id: str, background_tasks: BackgroundTasks):
+    """Handle streaming response"""
+    
+    async def generate_stream():
+        full_answer = ""
+        try:
+            # Generate streaming response
+            stream = generate_stream_response_with_ollama(
+                context, question, conversation_history
+            )
+            
+            # Stream tokens
+            for token in stream:
+                full_answer += token
+                yield f"data: {json.dumps({'token': token, 'conversation_id': conversation_id, 'is_final': False})}\n\n"
+            
+            # Final message
+            yield f"data: {json.dumps({'token': '', 'conversation_id': conversation_id, 'is_final': True})}\n\n"
+            
+        except Exception as e:
+            error_msg = "Error: Sistem sedang gangguan."
+            yield f"data: {json.dumps({'token': error_msg, 'conversation_id': conversation_id, 'is_final': True})}\n\n"
+            full_answer = error_msg
+        
+        finally:
+            # Save to conversation history in background
+            max_score = max([result["score"] for result in results])
+            background_tasks.add_task(
+                conversation_manager.add_message,
+                conversation_id,
+                "user",
+                question,
+                {"has_relevant_docs": True, "doc_count": len(results), "max_score": max_score}
+            )
+            background_tasks.add_task(
+                conversation_manager.add_message,
+                conversation_id,
+                "assistant",
+                full_answer,
+                {"has_relevant_docs": True, "sources_count": len(results)}
+            )
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
 
 
 @app.get("/conversations/{conversation_id}", tags=["Conversations"])

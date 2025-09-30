@@ -1,5 +1,11 @@
+from enum import Enum
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+
+
+class StreamOption(str, Enum):
+    TRUE = "true"
+    FALSE = "false"
 
 
 class Document(BaseModel):
@@ -37,9 +43,18 @@ class Query(BaseModel):
     question: str
     top_k: Optional[int] = 3
     conversation_id: Optional[str] = None
+    stream: Optional[StreamOption] = StreamOption.FALSE
 
 
 class ConversationContext:
     def __init__(self, conversation_id: str, messages: List[Dict] = None):
         self.conversation_id = conversation_id
         self.messages = messages or []
+
+# Untuk streaming response
+
+
+class StreamResponse(BaseModel):
+    token: str
+    conversation_id: Optional[str] = None
+    is_final: bool = False

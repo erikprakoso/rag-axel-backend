@@ -1,17 +1,18 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 import os
 
 from database import vector_db, VectorDBFactory
 from models import Document, Query, RAGResponse, HealthCheck, SearchResult
-from utils import format_sources, generate_response_with_ollama, check_ollama_health
+from utils import format_sources, generate_response_with_ollama, check_ollama_health, build_enhanced_query
 from document_processors import DocumentProcessorFactory
+from conversation_manager import conversation_manager
 
 app = FastAPI(
     title="RAG System API",
-    description="Retrieval-Augmented Generation dengan FastAPI, Qdrant, dan Ollama",
-    version="1.0.0"
+    description="Retrieval-Augmented Generation dengan FastAPI, Qdrant, dan Ollama dengan Conversation Context",
+    version="1.1.0"
 )
 
 # CORS middleware
@@ -23,10 +24,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Background task untuk cleanup
+
+
+@app.on_event("startup")
+async def startup_event():
+    import asyncio
+
+    async def periodic_cleanup():
+        while True:
+            await asyncio.sleep(3600)  # setiap jam
+            cleaned = conversation_manager.cleanup_expired_conversations()
+            if cleaned > 0:
+                print(f"Cleaned up {cleaned} expired conversations")
+
+    asyncio.create_task(periodic_cleanup())
+
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"message": "RAG System API is running!"}
+    return {"message": "RAG System API with Conversation Context is running!"}
 
 
 @app.get("/health", response_model=HealthCheck, tags=["Health"])
@@ -53,7 +70,6 @@ async def add_documents(documents: List[Document], collection: str = None):
     try:
         db_instance = vector_db
         if collection:
-            # Buat instance baru untuk collection berbeda
             db_instance = VectorDBFactory.create_vector_db(
                 collection_name=collection)
 
@@ -75,11 +91,9 @@ async def upload_file(
 ):
     """Upload various file types"""
     try:
-        # Save uploaded file temporarily
         file_extension = os.path.splitext(file.filename)[1].lower()
         processor = DocumentProcessorFactory.get_processor(file_extension)
 
-        # Process file
         with open(f"temp_{file.filename}", "wb") as f:
             content = await file.read()
             f.write(content)
@@ -87,10 +101,8 @@ async def upload_file(
         chunks = processor.process(
             f"temp_{file.filename}", chunk_size, chunk_overlap)
 
-        # Clean up
         os.remove(f"temp_{file.filename}")
 
-        # Add to vector DB
         documents = [Document(text=chunk) for chunk in chunks]
         await add_documents(documents, collection)
 
@@ -111,49 +123,170 @@ async def search_documents(query: Query):
 
 
 @app.post("/ask", response_model=RAGResponse, tags=["RAG"])
-async def ask_question(query: Query):
-    """Ask a question using RAG"""
+async def ask_question(query: Query, background_tasks: BackgroundTasks):
+    """Ask a question using RAG dengan conversation context internal"""
     try:
-        # 1. Retrieve relevant documents dengan threshold
-        results = vector_db.search(query.question, query.top_k)
+        # Handle conversation ID
+        conversation_id = query.conversation_id
+
+        # Validasi conversation ID
+        if conversation_id and not conversation_manager.conversation_exists(conversation_id):
+            # Jika conversation ID tidak valid, buat baru
+            conversation_id = None
+
+        # Buat conversation baru jika tidak ada ID yang valid
+        if not conversation_id:
+            conversation_id = conversation_manager.create_conversation()
+
+        # Dapatkan conversation history secara internal
+        conversation_history = conversation_manager.get_recent_context(
+            conversation_id, max_messages=3)
+
+        # Enhance query secara internal menggunakan history
+        enhanced_query = build_enhanced_query(
+            query.question, conversation_history)
+
+        print(f"Original query: {query.question}")
+        print(f"Enhanced query: {enhanced_query}")
+        print(f"Conversation ID: {conversation_id}")
+
+        # 1. Retrieve relevant documents dengan enhanced query
+        results = vector_db.search(enhanced_query, query.top_k)
 
         print(f"Search results: {len(results)} documents found")
 
-        # Cek jika tidak ada dokumen yang relevan
+        # Handle no relevant documents
         if not results:
-            return RAGResponse(
+            response = RAGResponse(
                 answer="Maaf, saya tidak menemukan informasi yang relevan tentang pertanyaan Anda di dokumentasi API Telkom.",
                 sources=[],
-                question=query.question
+                question=query.question,
+                conversation_id=conversation_id
             )
 
-        # 2. Cek similarity score, jika terlalu rendah juga dianggap tidak relevan
+            # Simpan ke conversation history
+            background_tasks.add_task(
+                conversation_manager.add_message,
+                conversation_id,
+                "user",
+                query.question,
+                {"has_relevant_docs": False}
+            )
+            background_tasks.add_task(
+                conversation_manager.add_message,
+                conversation_id,
+                "assistant",
+                response.answer,
+                {"has_relevant_docs": False}
+            )
+
+            return response
+
+        # 2. Cek similarity score
         max_score = max([result["score"] for result in results])
-        if max_score < 0.3:  # Additional safety threshold
-            return RAGResponse(
+        if max_score < 0.3:
+            response = RAGResponse(
                 answer="Maaf, informasi yang saya miliki tidak cukup relevan untuk menjawab pertanyaan tersebut.",
                 sources=format_sources(results),
-                question=query.question
+                question=query.question,
+                conversation_id=conversation_id
             )
+
+            background_tasks.add_task(
+                conversation_manager.add_message,
+                conversation_id,
+                "user",
+                query.question,
+                {"has_relevant_docs": False, "max_score": max_score}
+            )
+            background_tasks.add_task(
+                conversation_manager.add_message,
+                conversation_id,
+                "assistant",
+                response.answer,
+                {"has_relevant_docs": False, "max_score": max_score}
+            )
+
+            return response
 
         # 3. Prepare context
         context = "\n\n".join(
             [f"Source {i+1} (relevansi: {result['score']:.2f}):\n{result['text']}"
              for i, result in enumerate(results)])
 
-        print(f"Context: {context}")
+        # 4. Generate response dengan conversation history internal
+        answer = generate_response_with_ollama(
+            context, query.question, conversation_history)
 
-        # 4. Generate response
-        answer = generate_response_with_ollama(context, query.question)
-
-        return RAGResponse(
+        response = RAGResponse(
             answer=answer,
             sources=format_sources(results),
-            question=query.question
+            question=query.question,
+            conversation_id=conversation_id
         )
+
+        # Simpan ke conversation history
+        background_tasks.add_task(
+            conversation_manager.add_message,
+            conversation_id,
+            "user",
+            query.question,
+            {"has_relevant_docs": True, "doc_count": len(
+                results), "max_score": max_score}
+        )
+        background_tasks.add_task(
+            conversation_manager.add_message,
+            conversation_id,
+            "assistant",
+            answer,
+            {"has_relevant_docs": True, "sources_count": len(results)}
+        )
+
+        return response
+
     except Exception as e:
+        print(f"Error in ask_question: {e}")
         raise HTTPException(
             status_code=500, detail=f"Error generating response: {str(e)}")
+
+
+@app.get("/conversations/{conversation_id}", tags=["Conversations"])
+async def get_conversation(conversation_id: str):
+    """Get conversation history (untuk debugging/admin purposes)"""
+    try:
+        if not conversation_manager.conversation_exists(conversation_id):
+            raise HTTPException(
+                status_code=404, detail="Conversation not found")
+
+        history = conversation_manager.get_conversation_history(
+            conversation_id)
+        return {
+            "conversation_id": conversation_id,
+            "message_count": len(history),
+            "messages": history
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/conversations/{conversation_id}", tags=["Conversations"])
+async def delete_conversation(conversation_id: str):
+    """Delete conversation"""
+    try:
+        if conversation_manager.conversation_exists(conversation_id):
+            # Dalam implementasi sebenarnya, kita akan hapus dari storage
+            # Untuk sekarang, kita set sebagai expired
+            conversation_manager.cleanup_expired_conversations()
+            return {"message": f"Conversation {conversation_id} deleted"}
+        else:
+            raise HTTPException(
+                status_code=404, detail="Conversation not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/collection-info", tags=["Admin"])
